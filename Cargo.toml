@@ -1,0 +1,11 @@
+[package]
+name = "hpfile"
+version = "0.1.0"
+edition = "2021"
+description = "Head-prunable file."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.86"
+dashmap = "5.4.0"
+
