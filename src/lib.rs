@@ -1,32 +1,83 @@
+//! # Head-prunable file
+//!
+//! Normal files can not be pruned\(truncated\) from the beginning to some middle position.
+//! A `HPFile` use a sequence of small files to simulate one big virtual file. Thus, pruning
+//! from the beginning is to delete the first several small files.
+//!
+//! A `HPFile` can only be read and appended. Any byteslice which was written to it is
+//! immutable.
+//!
+//! To append a new byteslice into a `HPFile`, use the `append` function, which will return
+//! the start position of this byteslice. Later, just pass this start position to `read_at`
+//! for reading this byteslice out. The position passed to `read_at` must be the beginning of a
+//! byteslice that was written before, instead of its middle. Do NOT try to read the later
+//! half (from a middle point to the end) of a byteslice.
+//!
+//! A `HPFile` can also be truncated: discarding the content from a given position to the
+//! end of the file. During trucation, several small files may be removed and one small file
+//! may get truncated.
+//!
+//! A `HPFile` can serve many reader threads. If a reader thread just read random positions,
+//! plain `read_at` is enough. If a reader tends to read many adjacent byteslices in sequence, it
+//! can take advantage of spatial locality by using `read_at_with_pre_reader`, which uses a
+//! `PreReader` to read large chunks of data from file and cache them. Each reader thread can have
+//! its own `PreReader`. A `PreReader` cannot be shared by different `HPFile`s.
+//!
+//! A `HPFile` can serve only one writer thread. The writer thread must own a write buffer that
+//! collects small pieces of written data into one big single write to the underlying OS file,
+//! to avoid the cost of many syscalls writing the OS file. This write buffer must be provided
+//! when calling `append` and `flush`. It is owned by the writer thead, instead of `HPFile`,
+//! because we want `HPFile` to be shared between many reader threads.
+//!
+//! `TempDir` is used in unit test. It is a temporary directory created during a unit test
+//! function, and will be deleted when this test function exits.
+
+use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use std::{
-    fs::{self, File, create_dir, metadata, read_dir, remove_dir_all},
+    fs::{self, create_dir, metadata, read_dir, remove_dir_all, File},
     io::{self, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
     path::Path,
     sync::atomic::{AtomicI64, Ordering},
 };
-use anyhow::{anyhow, Result};
-use dashmap::DashMap;
 
 const PRE_READ_BUF_SIZE: usize = 512 * 1024;
 
+/// Head-prunable file
 #[derive(Debug)]
 pub struct HPFile {
-    dir_name: String,
-    segment_size: i64,
-    buffer_size: i64,
+    dir_name: String, // where we store the small files
+    segment_size: i64, // the size of each small file
+    buffer_size: i64, // the write buffer's size
     file_map: DashMap<i64, File>,
     largest_id: AtomicI64,
     latest_file_size: AtomicI64,
 }
 
 impl HPFile {
-    pub fn new(buffer_size: i64, segment_size: i64, dir_name: String) -> Result<HPFile> {
-        if segment_size % buffer_size != 0 {
+/// Create a `HPFile` with a directory. If this directory was used by an old HPFile, the old
+/// HPFile must have the same `segment_size` as this one.
+///
+/// # Parameters
+///
+/// - `wr_buf_size`: The write buffer used in `append` will not exceed this size
+/// - `segment_size`: The target size of the small files
+/// - `dir_name`: The name of the directory used to store the small files
+///
+/// # Returns
+///
+/// A `Result` which is:
+///
+/// - `Ok`: A successfully initialized `HPFile`
+/// - `Err`: Encounted some file system error.
+///
+    pub fn new(wr_buf_size: i64, segment_size: i64, dir_name: String) -> Result<HPFile> {
+        if segment_size % wr_buf_size != 0 {
             return Err(anyhow!(
-                "Invalid segmentSize:{} bufferSize:{}",
+                "Invalid segmentSize:{} writeBufferSize:{}",
                 segment_size,
-                buffer_size
+                wr_buf_size
             ));
         }
 
@@ -37,13 +88,14 @@ impl HPFile {
         Ok(HPFile {
             dir_name: dir_name.clone(),
             segment_size: segment_size,
-            buffer_size,
+            buffer_size: wr_buf_size,
             file_map,
             largest_id: AtomicI64::new(largest_id),
             latest_file_size: AtomicI64::new(latest_file_size),
         })
     }
 
+/// Create an empty `HPFile` that has no function and can only be used as placeholder.
     pub fn empty() -> HPFile {
         HPFile {
             dir_name: "".to_owned(),
@@ -55,6 +107,7 @@ impl HPFile {
         }
     }
 
+/// Returns whether this `HPFile` is empty.
     pub fn is_empty(&self) -> bool {
         self.segment_size == 0
     }
@@ -125,11 +178,26 @@ impl HPFile {
         Ok((file_map, latest_file_size))
     }
 
+/// Returns the size of the virtual large file
     pub fn size(&self) -> i64 {
         self.largest_id.load(Ordering::SeqCst) * self.segment_size
             + self.latest_file_size.load(Ordering::SeqCst)
     }
 
+/// Truncate the file to make it smaller
+///
+/// # Parameters
+///
+/// - `size`: the size of the virtual large file after truncation. It must be smaller 
+///           than the original size.
+///
+/// # Returns
+///
+/// A `Result` which is:
+///
+/// - `Ok`: It's truncated successfully
+/// - `Err`: Encounted some file system error.
+///
     pub fn truncate(&self, size: i64) -> io::Result<()> {
         if self.is_empty() {
             return Ok(());
@@ -158,6 +226,19 @@ impl HPFile {
         Ok(())
     }
 
+/// Flush the remained data in `buffer` into file system
+///
+/// # Parameters
+///
+/// - `buffer`: the write buffer, which is used by the client to call `append`.
+///
+/// # Returns
+///
+/// A `Result` which is:
+///
+/// - `Ok`: It's flushed successfully
+/// - `Err`: Encounted some file system error.
+///
     pub fn flush(&self, buffer: &mut Vec<u8>) -> io::Result<()> {
         if self.is_empty() {
             return Ok(());
@@ -175,42 +256,71 @@ impl HPFile {
         f.sync_all()
     }
 
+/// Close the opened small files
     pub fn close(&self) {
         self.file_map.clear();
     }
 
-    pub fn read_at(&self, buf: &mut [u8], off: i64) -> io::Result<usize> {
-        let file_id = off / self.segment_size;
-        let pos = off % self.segment_size;
+/// Read data from file at `offset` to fill `buf`
+///
+/// # Parameters
+///
+/// - `offset`: the start position of a byteslice that was written before
+///
+/// # Returns
+///
+/// A `Result` which is:
+///
+/// - `Ok`: Number of bytes that was filled into `buf`
+/// - `Err`: Encounted some file system error.
+///
+    pub fn read_at(&self, buf: &mut [u8], offset: i64) -> io::Result<usize> {
+        let file_id = offset / self.segment_size;
+        let pos = offset % self.segment_size;
         let opt = self.file_map.get(&file_id);
         let f = opt.as_ref().unwrap().value();
         f.read_at(buf, pos as u64)
     }
 
+/// Read at most `num_bytes` from file at `offset` to fill `buf`
+///
+/// # Parameters
+///
+/// - `buf`: a vector to be filled
+/// - `num_bytes`: the wanted number of bytes to be read
+/// - `offset`: the start position of a byteslice that was written before
+/// - `pre_reader`: a PreReader used to take advantage of spatial locality
+///
+/// # Returns
+///
+/// A `Result` which is:
+///
+/// - `Ok`: Number of bytes that was filled into `buf`
+/// - `Err`: Encounted some file system error.
+///
     pub fn read_at_with_pre_reader(
         &self,
         buf: &mut Vec<u8>,
         num_bytes: usize,
-        off: i64,
+        offset: i64,
         pre_reader: &mut PreReader,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
         if buf.len() < num_bytes {
             buf.resize(num_bytes, 0);
         }
 
-        let file_id = off / self.segment_size;
-        let pos = off % self.segment_size;
+        let file_id = offset / self.segment_size;
+        let pos = offset % self.segment_size;
 
         if pre_reader.try_read(file_id, pos, &mut buf[..num_bytes]) {
-            return Ok(());
+            return Ok(num_bytes);
         }
 
         let opt = self.file_map.get(&file_id);
         let f = opt.as_ref().unwrap().value();
 
         if num_bytes >= PRE_READ_BUF_SIZE || pos + num_bytes as i64 > self.segment_size {
-            f.read_at(&mut buf[..num_bytes], pos as u64)?;
-            return Ok(());
+            return f.read_at(&mut buf[..num_bytes], pos as u64);
         }
 
         pre_reader.fill_slice(file_id, pos, |slice| {
@@ -218,28 +328,38 @@ impl HPFile {
         })?;
 
         if !pre_reader.try_read(file_id, pos, &mut buf[..num_bytes]) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Cannot read data just fetched in {} fileID {}",
-                    self.dir_name, file_id
-                ),
-            ));
+            panic!(
+                "Internal error: cannot read data just fetched in {} fileID {}",
+                self.dir_name, file_id
+            );
         }
 
-        Ok(())
+        Ok(num_bytes)
     }
 
+/// Append a byteslice to the file. This byteslice may be temporarily held in
+/// `buffer` before flushing.
+///
+/// # Parameters
+///
+/// - `bz`: the byteslice to append. It cannot be longer than `wr_buf_size` specified
+///         in `HPFile::new`.
+/// - `buffer`: the write buffer. It will never be larger than `wr_buf_size`.
+///
+/// # Returns
+///
+/// A `Result` which is:
+///
+/// - `Ok`: the start position where this byteslice locates in the file
+/// - `Err`: Encounted some file system error.
+///
     pub fn append(&self, bz: &[u8], buffer: &mut Vec<u8>) -> io::Result<i64> {
         if self.is_empty() {
             return Ok(0);
         }
 
         if bz.len() as i64 > self.buffer_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bz is too large",
-            ));
+            panic!("bz is too large");
         }
 
         let mut largest_id = self.largest_id.load(Ordering::SeqCst);
@@ -288,12 +408,13 @@ impl HPFile {
         Ok(start_pos)
     }
 
-    pub fn prune_head(&self, off: i64) -> io::Result<()> {
+/// Prune from the beginning to `offset`. This part of the file cannot be read hereafter.
+    pub fn prune_head(&self, offset: i64) -> io::Result<()> {
         if self.is_empty() {
             return Ok(());
         }
 
-        let file_id = off / self.segment_size;
+        let file_id = offset / self.segment_size;
         let ids_to_remove: Vec<i64> = self
             .file_map
             .iter()
@@ -311,6 +432,7 @@ impl HPFile {
     }
 }
 
+/// Pre-read a large chunk of data from file for caching
 #[derive(Debug)]
 pub struct PreReader {
     buffer: Box<[u8]>, // size is PRE_READ_BUF_SIZE
@@ -320,6 +442,7 @@ pub struct PreReader {
 }
 
 impl PreReader {
+    /// Create a `PreReader` to be used in `HPFile::read_at_with_pre_reader`
     pub fn new() -> Self {
         Self {
             buffer: vec![0; PRE_READ_BUF_SIZE].into_boxed_slice(),
@@ -351,11 +474,13 @@ impl PreReader {
     }
 }
 
+/// Temporary directory for unit test
 pub struct TempDir {
     dir: String,
 }
 
 impl TempDir {
+    /// Create a new TempDir
     pub fn new(dir: &str) -> Self {
         remove_dir_all(dir).unwrap_or(()); // ignore error
         create_dir(dir).unwrap_or(()); // ignore error
@@ -364,14 +489,17 @@ impl TempDir {
         }
     }
 
+    /// Return the path of this temporary directory
     pub fn to_string(&self) -> String {
         self.dir.clone()
     }
 
+    /// Return the names of the files in this directory
     pub fn list(&self) -> Vec<String> {
         TempDir::list_dir(&self.dir)
     }
 
+    /// Return the names of the files in `dir`
     pub fn list_dir(dir: &str) -> Vec<String> {
         let mut result = vec![];
         let paths = std::fs::read_dir(Path::new(dir)).unwrap();
@@ -382,11 +510,13 @@ impl TempDir {
         result
     }
 
+    /// Create a new file in this directory
     pub fn create_file(&self, name: &str) {
         let file_path = Path::new(&self.dir).join(Path::new(name));
         File::create_new(file_path).unwrap();
     }
 
+    /// Return the names of the files in `path` and its subdirectories recursively
     pub fn list_all(path: &Path) -> Vec<String> {
         let mut vec = Vec::new();
         TempDir::_list_files(&mut vec, path);
@@ -414,7 +544,6 @@ impl Drop for TempDir {
         remove_dir_all(&self.dir).unwrap_or(()); // ignore error
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -543,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid segmentSize:127 bufferSize:64")]
+    #[should_panic(expected = "Invalid segmentSize:127 writeBufferSize:64")]
     fn test_new_file_invalid_buffer_or_segment_size() {
         let dir = TempDir::new("test_new_file_invalid_buffer_or_segment_size");
         let buffer_size = 64;
