@@ -47,31 +47,33 @@ const PRE_READ_BUF_SIZE: usize = 512 * 1024;
 /// Head-prunable file
 #[derive(Debug)]
 pub struct HPFile {
-    dir_name: String, // where we store the small files
+    dir_name: String,  // where we store the small files
     segment_size: i64, // the size of each small file
-    buffer_size: i64, // the write buffer's size
+    buffer_size: i64,  // the write buffer's size
     file_map: DashMap<i64, File>,
     largest_id: AtomicI64,
     latest_file_size: AtomicI64,
+    file_size: AtomicI64,
+    file_size_on_disk: AtomicI64,
 }
 
 impl HPFile {
-/// Create a `HPFile` with a directory. If this directory was used by an old HPFile, the old
-/// HPFile must have the same `segment_size` as this one.
-///
-/// # Parameters
-///
-/// - `wr_buf_size`: The write buffer used in `append` will not exceed this size
-/// - `segment_size`: The target size of the small files
-/// - `dir_name`: The name of the directory used to store the small files
-///
-/// # Returns
-///
-/// A `Result` which is:
-///
-/// - `Ok`: A successfully initialized `HPFile`
-/// - `Err`: Encounted some file system error.
-///
+    /// Create a `HPFile` with a directory. If this directory was used by an old HPFile, the old
+    /// HPFile must have the same `segment_size` as this one.
+    ///
+    /// # Parameters
+    ///
+    /// - `wr_buf_size`: The write buffer used in `append` will not exceed this size
+    /// - `segment_size`: The target size of the small files
+    /// - `dir_name`: The name of the directory used to store the small files
+    ///
+    /// # Returns
+    ///
+    /// A `Result` which is:
+    ///
+    /// - `Ok`: A successfully initialized `HPFile`
+    /// - `Err`: Encounted some file system error.
+    ///
     pub fn new(wr_buf_size: i64, segment_size: i64, dir_name: String) -> Result<HPFile> {
         if segment_size % wr_buf_size != 0 {
             return Err(anyhow!(
@@ -85,6 +87,7 @@ impl HPFile {
         let (file_map, latest_file_size) =
             Self::load_file_map(&dir_name, segment_size, id_list, largest_id)?;
 
+        let file_size = largest_id * segment_size + latest_file_size;
         Ok(HPFile {
             dir_name: dir_name.clone(),
             segment_size: segment_size,
@@ -92,10 +95,12 @@ impl HPFile {
             file_map,
             largest_id: AtomicI64::new(largest_id),
             latest_file_size: AtomicI64::new(latest_file_size),
+            file_size: AtomicI64::new(file_size),
+            file_size_on_disk: AtomicI64::new(file_size),
         })
     }
 
-/// Create an empty `HPFile` that has no function and can only be used as placeholder.
+    /// Create an empty `HPFile` that has no function and can only be used as placeholder.
     pub fn empty() -> HPFile {
         HPFile {
             dir_name: "".to_owned(),
@@ -104,10 +109,12 @@ impl HPFile {
             file_map: DashMap::with_capacity(0),
             largest_id: AtomicI64::new(0),
             latest_file_size: AtomicI64::new(0),
+            file_size: AtomicI64::new(0),
+            file_size_on_disk: AtomicI64::new(0),
         }
     }
 
-/// Returns whether this `HPFile` is empty.
+    /// Returns whether this `HPFile` is empty.
     pub fn is_empty(&self) -> bool {
         self.segment_size == 0
     }
@@ -178,26 +185,30 @@ impl HPFile {
         Ok((file_map, latest_file_size))
     }
 
-/// Returns the size of the virtual large file
+    /// Returns the size of the virtual large file, including the non-flushed bytes
     pub fn size(&self) -> i64 {
-        self.largest_id.load(Ordering::SeqCst) * self.segment_size
-            + self.latest_file_size.load(Ordering::SeqCst)
+        self.file_size.load(Ordering::SeqCst)
     }
 
-/// Truncate the file to make it smaller
-///
-/// # Parameters
-///
-/// - `size`: the size of the virtual large file after truncation. It must be smaller 
-///           than the original size.
-///
-/// # Returns
-///
-/// A `Result` which is:
-///
-/// - `Ok`: It's truncated successfully
-/// - `Err`: Encounted some file system error.
-///
+    /// Returns the flushed size of the virtual large file
+    pub fn size_on_disk(&self) -> i64 {
+        self.file_size_on_disk.load(Ordering::SeqCst)
+    }
+
+    /// Truncate the file to make it smaller
+    ///
+    /// # Parameters
+    ///
+    /// - `size`: the size of the virtual large file after truncation. It must be smaller
+    ///           than the original size.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` which is:
+    ///
+    /// - `Ok`: It's truncated successfully
+    /// - `Err`: Encounted some file system error.
+    ///
     pub fn truncate(&self, size: i64) -> io::Result<()> {
         if self.is_empty() {
             return Ok(());
@@ -222,58 +233,61 @@ impl HPFile {
         self.file_map.insert(largest_id, f);
         self.latest_file_size
             .store(remaining_size, Ordering::SeqCst);
+        self.file_size.store(size, Ordering::SeqCst);
+        self.file_size_on_disk.store(size, Ordering::SeqCst);
 
         Ok(())
     }
 
-/// Flush the remained data in `buffer` into file system
-///
-/// # Parameters
-///
-/// - `buffer`: the write buffer, which is used by the client to call `append`.
-///
-/// # Returns
-///
-/// A `Result` which is:
-///
-/// - `Ok`: It's flushed successfully
-/// - `Err`: Encounted some file system error.
-///
+    /// Flush the remained data in `buffer` into file system
+    ///
+    /// # Parameters
+    ///
+    /// - `buffer`: the write buffer, which is used by the client to call `append`.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` which is:
+    ///
+    /// - `Ok`: It's flushed successfully
+    /// - `Err`: Encounted some file system error.
+    ///
     pub fn flush(&self, buffer: &mut Vec<u8>) -> io::Result<()> {
         if self.is_empty() {
             return Ok(());
         }
         let largest_id = self.largest_id.load(Ordering::SeqCst);
-        // todo: is it the largest id safe?
         let mut opt = self.file_map.get_mut(&largest_id);
         let mut f = opt.as_mut().unwrap().value();
         if buffer.len() != 0 {
             f.seek(SeekFrom::End(0)).unwrap();
             f.write(&buffer).unwrap();
+            self.file_size_on_disk
+                .fetch_add(buffer.len() as i64, Ordering::SeqCst);
             buffer.clear();
         }
 
         f.sync_all()
     }
 
-/// Close the opened small files
+    /// Close the opened small files
     pub fn close(&self) {
         self.file_map.clear();
     }
 
-/// Read data from file at `offset` to fill `buf`
-///
-/// # Parameters
-///
-/// - `offset`: the start position of a byteslice that was written before
-///
-/// # Returns
-///
-/// A `Result` which is:
-///
-/// - `Ok`: Number of bytes that was filled into `buf`
-/// - `Err`: Encounted some file system error.
-///
+    /// Read data from file at `offset` to fill `buf`
+    ///
+    /// # Parameters
+    ///
+    /// - `offset`: the start position of a byteslice that was written before
+    ///
+    /// # Returns
+    ///
+    /// A `Result` which is:
+    ///
+    /// - `Ok`: Number of bytes that was filled into `buf`
+    /// - `Err`: Encounted some file system error.
+    ///
     pub fn read_at(&self, buf: &mut [u8], offset: i64) -> io::Result<usize> {
         let file_id = offset / self.segment_size;
         let pos = offset % self.segment_size;
@@ -282,22 +296,22 @@ impl HPFile {
         f.read_at(buf, pos as u64)
     }
 
-/// Read at most `num_bytes` from file at `offset` to fill `buf`
-///
-/// # Parameters
-///
-/// - `buf`: a vector to be filled
-/// - `num_bytes`: the wanted number of bytes to be read
-/// - `offset`: the start position of a byteslice that was written before
-/// - `pre_reader`: a PreReader used to take advantage of spatial locality
-///
-/// # Returns
-///
-/// A `Result` which is:
-///
-/// - `Ok`: Number of bytes that was filled into `buf`
-/// - `Err`: Encounted some file system error.
-///
+    /// Read at most `num_bytes` from file at `offset` to fill `buf`
+    ///
+    /// # Parameters
+    ///
+    /// - `buf`: a vector to be filled
+    /// - `num_bytes`: the wanted number of bytes to be read
+    /// - `offset`: the start position of a byteslice that was written before
+    /// - `pre_reader`: a PreReader used to take advantage of spatial locality
+    ///
+    /// # Returns
+    ///
+    /// A `Result` which is:
+    ///
+    /// - `Ok`: Number of bytes that was filled into `buf`
+    /// - `Err`: Encounted some file system error.
+    ///
     pub fn read_at_with_pre_reader(
         &self,
         buf: &mut Vec<u8>,
@@ -337,22 +351,22 @@ impl HPFile {
         Ok(num_bytes)
     }
 
-/// Append a byteslice to the file. This byteslice may be temporarily held in
-/// `buffer` before flushing.
-///
-/// # Parameters
-///
-/// - `bz`: the byteslice to append. It cannot be longer than `wr_buf_size` specified
-///         in `HPFile::new`.
-/// - `buffer`: the write buffer. It will never be larger than `wr_buf_size`.
-///
-/// # Returns
-///
-/// A `Result` which is:
-///
-/// - `Ok`: the start position where this byteslice locates in the file
-/// - `Err`: Encounted some file system error.
-///
+    /// Append a byteslice to the file. This byteslice may be temporarily held in
+    /// `buffer` before flushing.
+    ///
+    /// # Parameters
+    ///
+    /// - `bz`: the byteslice to append. It cannot be longer than `wr_buf_size` specified
+    ///         in `HPFile::new`.
+    /// - `buffer`: the write buffer. It will never be larger than `wr_buf_size`.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` which is:
+    ///
+    /// - `Ok`: the start position where this byteslice locates in the file
+    /// - `Err`: Encounted some file system error.
+    ///
     pub fn append(&self, bz: &[u8], buffer: &mut Vec<u8>) -> io::Result<i64> {
         if self.is_empty() {
             return Ok(0);
@@ -367,6 +381,7 @@ impl HPFile {
         let old_size = self
             .latest_file_size
             .fetch_add(bz.len() as i64, Ordering::SeqCst);
+        self.file_size.fetch_add(bz.len() as i64, Ordering::SeqCst);
         let mut split_pos = 0;
         let extra_bytes = (buffer.len() + bz.len()) as i64 - self.buffer_size;
         if extra_bytes > 0 {
@@ -375,9 +390,11 @@ impl HPFile {
             buffer.extend_from_slice(&bz[0..split_pos]);
             let mut opt = self.file_map.get_mut(&largest_id);
             let mut f = opt.as_mut().unwrap().value();
-            if let Err(_) = f.write(buffer.as_slice()) {
+            if let Err(_) = f.write(&buffer) {
                 panic!("Fail to write file");
             }
+            self.file_size_on_disk
+                .fetch_add(buffer.len() as i64, Ordering::SeqCst);
             buffer.clear();
         }
         buffer.extend_from_slice(&bz[split_pos..]); //put remained bytes into buffer
@@ -408,7 +425,7 @@ impl HPFile {
         Ok(start_pos)
     }
 
-/// Prune from the beginning to `offset`. This part of the file cannot be read hereafter.
+    /// Prune from the beginning to `offset`. This part of the file cannot be read hereafter.
     pub fn prune_head(&self, offset: i64) -> io::Result<()> {
         if self.is_empty() {
             return Ok(());
